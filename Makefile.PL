@@ -504,6 +504,20 @@ my @opt_components
                     'IO::Scalar' => 0, },
      },
 
+     { name => 'tv_grab_uk_rt',
+       blurb => 'Grabber for UK using the Radiotimes API',
+       exes => [ 'grab/uk_rt/tv_grab_uk_rt' ],
+       share_files => {
+            'grab/uk_rt/tv_grab_uk_rt.map.conf'
+                => 'tv_grab_uk_rt/tv_grab_uk_rt.map.conf',
+       },
+       prereqs => { 'LWP::Simple' => 0,
+                    'DateTime'    => 0,
+                    'URI::Escape' => 0,
+                    'JSON'        => 0,
+                    'XML::LibXML' => 0, },
+     },
+
      { name => 'tv_grab_uk_tvguide',
        blurb => 'Grabber for UK and Ireland using TV Guide website',
        exes => [ 'grab/uk_tvguide/tv_grab_uk_tvguide' ],

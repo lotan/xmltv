@@ -1,0 +1,312 @@
+#!/usr/bin/perl -w
+
+=pod
+
+=head1 NAME
+
+tv_grab_uk_rt - Grab TV listings for the United Kingdom Radiotimes.
+
+=head1 SYNOPSIS
+
+tv_grab_uk_rt --help
+
+tv_grab_uk_rt --configure [--config-file FILE]
+
+tv_grab_uk_rt [--config-file FILE]
+                 [--days N] [--offset N] [--channel xmltvid,xmltvid,...]
+                 [--output FILE] [--quiet] [--debug]
+
+tv_grab_uk_rt --list-channels [--config-file FILE]
+                 [--output FILE] [--quiet] [--debug]
+
+
+=head1 DESCRIPTION
+
+Output TV and listings in XMLTV format for many stations
+available in the United Kingdom. Data is downloaded from Radiotimes
+without any legal WARRANTY.
+
+First you must run B<tv_grab_uk_rt --configure> to choose which stations
+you want to receive.
+
+Then running B<tv_grab_uk_rt> with no arguments will get a listings for
+the stations you chose for five days including today.
+
+=head1 OPTIONS
+
+B<--configure> Prompt for which stations to download and write the
+configuration file.
+
+B<--config-file FILE> Set the name of the configuration file, the
+default is B<~/.xmltv/tv_grab_uk_rt.conf>.  This is the file written by
+B<--configure> and read when grabbing.
+
+B<--output FILE> When grabbing, write output to FILE rather than
+standard output.
+
+B<--days N> When grabbing, grab N days rather than 5.
+
+B<--offset N> Start grabbing at today + N days.
+
+B<--quiet> Only print error-messages on STDERR.
+
+B<--debug> Provide more information on progress to stderr to help in
+debugging.
+
+B<--list-channels>    Output a list of all channels that data is available
+                      for. The list is in xmltv-format.
+
+B<--capabilities> Show which capabilities the grabber supports. For more
+information, see L<http://wiki.xmltv.org/index.php/XmltvCapabilities>
+
+B<--version> Show the version of the grabber.
+
+B<--help> Print a help message and exit.
+
+=head1 ERROR HANDLING
+
+If the grabber fails to download data from webstep, it will print an
+errormessage to STDERR and then exit with a status code of 1 to indicate
+that the data is missing.
+
+=head1 ENVIRONMENT VARIABLES
+
+The environment variable HOME can be set to change where configuration
+files are stored. All configuration is stored in $HOME/.xmltv/. On Windows,
+it might be necessary to set HOME to a path without spaces in it.
+
+=head1 CREDITS
+
+Grabber written by Reinhold May, reinhold -dot- may -at- gmx -dot- de.
+This documentation copied from tv_grab_uk by Ed Avis,
+ed -at- membled -dot- com. Original grabber by Jiri Kaderavek,
+jiri -dot- kaderavek -at- webstep -dot- net with modifications by
+Petr Stehlik, pstehlik -at- sophics -dot- cz.
+
+=head1 BUGS
+
+None known.
+
+=cut
+
+use strict;
+use XMLTV;
+use XMLTV::Configure::Writer;
+use XMLTV::Options qw/ParseOptions/;
+use XMLTV::Supplement qw/GetSupplementLines/;
+use LWP::Simple qw/$ua get getprint is_success status_message/;
+use DateTime;
+use URI::Escape;
+use JSON;
+use XML::LibXML;
+
+$ua->agent("xmltv/$XMLTV::VERSION");
+
+# This undocumented --cache option for debugging is useful since
+# it will _always_ use a  cached copy of a page, without contacting
+# the server at all.
+use XMLTV::Memoize; XMLTV::Memoize::check_argv('get');
+
+my $GRABBER_NAME  = 'tv_grab_uk_rt';
+my $WEBROOT       = 'http://www.radiotimes.com';
+my $SCHEDULE      = $WEBROOT . '/rt-service/schedule/get?';
+
+# load and parse RFC2838 data and generate hashes (both ways) from it
+my $rfc2838data = GetSupplementLines($GRABBER_NAME, $GRABBER_NAME . '.map.conf');
+my (%uri2id, %id2uri);
+foreach my $line (@$rfc2838data) {
+    $line =~ m/^map==([^=]+)==(\S*)/ && do {
+        $uri2id{$2} = $1;
+        $id2uri{$1} = $2;
+    }
+}
+
+my ($opt, $conf) = ParseOptions({ grabber_name     => $GRABBER_NAME,
+                                  capabilities     => [qw/baseline manualconfig/],
+                                  stage_sub        => \&stage,
+                                  listchannels_sub => \&listchannels,
+                                  version          => "$XMLTV::VERSION",
+                                  description      => "The United Kingdom (www.radiotimes.com)" });
+
+if (!defined($conf->{channel})) {
+    print STDERR "Warning: No channels to be fetched\n";
+    exit(0);
+}
+
+my $timestamp = DateTime->today->add(days => $opt->{'offset'})->set_time_zone('Europe/London');
+
+# Get the actual data
+
+my $channels = join(',', map { get_id($_) } @{$conf->{channel}});
+
+my $url = $SCHEDULE . 'startDate=' . uri_escape($timestamp->strftime('%d-%m-%Y %H:%M:%S')). '&hours=' . $opt->{days} * 24 . '&totalWidthUnits=0&channels=' . $channels;
+
+print STDERR "Fetching $url\n" if $opt->{debug};
+
+my $res = get($url);
+
+if (!defined($res)) {
+    print STDERR "Error: Failed to download data\n";
+    exit(1);
+}
+# debug
+#open IN, '<schedule.json' or die;
+#local $/;
+#my $res = <IN>;
+#close IN;
+
+# parse JSON data
+my $data = decode_json($res);
+
+# start an XML document with tv element
+my ($doc, $tv) = create_xml_doc_tv();
+
+foreach my $c (@{$data->{'Channels'}}) {
+    my $uid = get_uri($c->{'Id'});
+    foreach my $p (@{$c->{'TvListings'}}) {
+        my $programme = $tv->addNewChild(undef, 'programme');
+        $programme->setAttribute('start', change_timestamp($p->{'StartTimeMF'}));
+        $programme->setAttribute('stop', change_timestamp($p->{'EndTimeMF'}));
+        $programme->setAttribute('channel', $uid);
+        my $title = $programme->addNewChild(undef, 'title');
+        $title->setAttribute('lang', 'en');
+        $title->appendText($p->{'Title'});
+        if (defined($p->{'Description'})) {
+            my $title = $programme->addNewChild(undef, 'desc');
+            $title->setAttribute('lang', 'en');
+            $title->appendText($p->{'Description'});
+        }
+        if ($p->{'Genre'} ne '') {
+            my $title = $programme->addNewChild(undef, 'category');
+            $title->setAttribute('lang', 'en');
+            $title->appendText($p->{'Genre'});
+        }
+        if (defined($p->{'EpisodePositionInSeries'})) {
+            my $title = $programme->addNewChild(undef, 'episode-num');
+            $title->setAttribute('system', 'xmltv_ns');
+            $title->appendText(xmltvns_episodenum($p->{'EpisodePositionInSeries'}));
+        }
+        if (defined($p->{'FilmStarRating'})) {
+            my $title = $programme->addNewChild(undef, 'star-rating');
+            $title->appendText($p->{'FilmStarRating'});
+        }
+    }
+}
+
+# XMLTV::Options has redirected stdout to a file for us if the
+# --output parameter was specified, so all we have to do is print
+# the xmltv data.
+
+print $doc->toString() . $tv->toString(2);
+
+sub stage {
+    my ($stage, $conf) = @_;
+
+    die "Unknown stage $stage" if $stage ne "start";
+
+    my $result;
+    my $writer = new XMLTV::Configure::Writer(OUTPUT   => \$result,
+                                              encoding => 'utf-8');
+    $writer->start({ grabber => $GRABBER_NAME });
+    $writer->end('select-channels');
+
+    return $result;
+}
+
+sub listchannels {
+    my ($conf, $opt) = @_;
+
+    # $conf contains the hashref returned by load_config().
+
+    # acquire channels from web page
+    my $channels = acquire_channels($opt);
+
+    # start an XML document with tv element
+    my ($doc, $tv) = create_xml_doc_tv();
+
+    # iterate over channels
+    foreach my $c (sort(keys(%$channels))) {
+        my $channel = $tv->addNewChild(undef, 'channel');
+        $channel->setAttribute('id', get_uri($channels->{$c}));
+        my $display_name = $channel->addNewChild(undef, 'display-name');
+        $display_name->appendText($c);
+    }
+
+    return $doc->toString() . $tv->toString(2);
+}
+
+# ---
+
+sub change_timestamp {
+    my $timestamp = shift;
+    $timestamp =~ s/[ :-]//g;
+    $timestamp =~ s/Z$/ +0000/;
+    return $timestamp;
+}
+
+sub xmltvns_episodenum {
+    my $episodenum = shift;
+    $episodenum =~ s/(\d+)\/(\d+).*/'.' . ($1 - 1) . '\/' . $2 . '.'/e;
+    return $episodenum;
+}
+
+sub acquire_channels {
+    my ($opt) = @_;
+
+    # download tv-listings html that contains channels
+
+    my $url = $WEBROOT . '/tv/tv-listings';
+    die "Failed to get $url" if not defined $url;
+
+    print STDERR "Fetching $url\n" if $opt->{debug};
+
+    my $res = get($url);
+    if (!defined($res)) {
+       print STDERR "Error: Failed to download data\n";
+       exit(1);
+    }
+    # debug
+#    open IN, '<tv-listings.html' or die;
+#    local $/;
+#    my $res = <IN>;
+#    close IN;
+
+    # crudely parse downloaded tv-listings into hash (mangled_name => [id, name])
+
+    my %channels;
+    while ($res =~ m/\bdata-channel-id="(\d+)"\s*data-channel-name="([^"]*)"/g) {
+        $channels{$2} = $1;    
+    }
+
+    return \%channels;
+}
+
+sub create_xml_doc_tv {
+    my $doc = XML::LibXML::Document->new('1.0', 'UTF-8');
+    my $dtd = $doc->createInternalSubset("tv", undef, "xmltv.dtd");
+
+    my $tv = $doc->createElement('tv');
+    $tv->setAttribute('source-info-url', 'https://www.radiotimes.com');
+    $tv->setAttribute('source-info-name', 'Radiotimes');
+    $tv->setAttribute('generator-info-url', 'http://www.xmltv.org');
+    $tv->setAttribute('generator-info-name', 'XMLTV');
+ 
+    return ($doc, $tv);
+}
+
+# translates the id into a uid and returns the id if no entry
+# has been found in the hash
+# uses the global id2uri hash
+sub get_uri {
+    my $id = shift;
+    my $uri = $id2uri{$id};
+    return defined($uri) ? $uri : $id;
+}
+
+# translates a uid into an id
+# if uid is numerical it return that number as the id
+# uses the global uri2id hash
+sub get_id {
+    my $uri = shift;
+    return ($uri =~ m/^\d+$/) ? $uri : $uri2id{$uri};
+}
